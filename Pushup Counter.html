@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pushup Counter</title>
+<style>
+:root{--bg:#000;--fg:#fff;--accent:#39ff88;--warn:#ffb020;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#000;--fg:#fff}}
+:root[data-theme="dark"]{--bg:#000;--fg:#fff}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;overflow:hidden}
+#wrap{position:relative;width:100%;height:100%;display:flex;align-items:center;justify-content:center}
+canvas{max-width:100%;max-height:100%;width:100%;height:100%;object-fit:contain}
+video{display:none}
+#count{position:absolute;top:calc(env(safe-area-inset-top,0px) + 8px);left:0;right:0;text-align:center;font-weight:800;font-size:min(34vw,34vh);line-height:1;text-shadow:0 4px 24px rgba(0,0,0,.8);pointer-events:none}
+#status{position:absolute;top:calc(env(safe-area-inset-top,0px) + min(36vw,36vh) + 16px);left:0;right:0;text-align:center;font-size:clamp(16px,3.2vw,26px);font-weight:700;text-shadow:0 2px 10px #000;pointer-events:none}
+#bar{position:absolute;right:14px;top:35%;bottom:18%;width:14px;border-radius:8px;background:rgba(255,255,255,.2);overflow:hidden}
+#fill{position:absolute;bottom:0;left:0;right:0;height:0;background:var(--accent);transition:height .06s}
+#btns{position:absolute;left:0;right:0;bottom:calc(env(safe-area-inset-bottom,0px) + 16px);display:flex;gap:10px;justify-content:center}
+button{font:inherit;font-weight:700;font-size:16px;padding:14px 22px;border-radius:14px;border:0;background:rgba(255,255,255,.18);color:var(--fg);backdrop-filter:blur(8px);cursor:pointer}
+button.primary{background:var(--accent);color:#000}
+#start{position:absolute;inset:0;display:flex;flex-direction:column;gap:16px;align-items:center;justify-content:center;background:var(--bg);text-align:center;padding:24px}
+#start h1{margin:0;font-size:clamp(28px,6vw,48px)}
+#start p{margin:0;max-width:420px;opacity:.75;line-height:1.5}
+#start button{font-size:20px;padding:18px 40px}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <video id="v" playsinline muted></video>
+  <div id="count">0</div>
+  <div id="status"></div>
+  <div id="bar"><div id="fill"></div></div>
+  <div id="btns">
+    <button id="flip">Flip camera</button>
+    <button id="reset">Reset</button>
+    <button id="mute">Sound on</button>
+  </div>
+  <div id="start">
+    <h1>Pushup Counter</h1>
+    <p>Prop your phone or laptop about 2 m away, <b>side-on</b>, so your whole body is in view. Get into plank and start.</p>
+    <button class="primary" id="go">Start camera</button>
+    <p id="err" style="color:var(--warn)"></p>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404/pose.js" crossorigin="anonymous"></script>
+<script>
+(function(){
+const $=id=>document.getElementById(id);
+const video=$('v'),cv=$('c'),ctx=cv.getContext('2d');
+let facing='user',stream=null,pose=null,running=false,sound=true;
+let count=0,stage=null,sm=null,downAt=0,lastPlank=0,lastCount=0;
+const UP=155,DOWN=100,MIN_REP_MS=350;
+
+function beep(f){if(!sound)return;try{const a=beep.a||(beep.a=new (window.AudioContext||window.webkitAudioContext)());const o=a.createOscillator(),g=a.createGain();o.frequency.value=f;g.gain.value=.15;o.connect(g);g.connect(a.destination);o.start();o.stop(a.currentTime+.12);}catch(e){}}
+
+function ang(a,b,c,W,H){
+  const v1=[(a.x-b.x)*W,(a.y-b.y)*H],v2=[(c.x-b.x)*W,(c.y-b.y)*H];
+  const d=v1[0]*v2[0]+v1[1]*v2[1],n=Math.hypot(...v1)*Math.hypot(...v2);
+  return n?Math.acos(Math.max(-1,Math.min(1,d/n)))*180/Math.PI:180;
+}
+
+const BONES=[[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28]];
+const ARM=[[11,13],[13,15],[12,14],[14,16]];
+
+async function startCam(){
+  if(stream)stream.getTracks().forEach(t=>t.stop());
+  stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:facing,width:{ideal:1280},height:{ideal:720}},audio:false});
+  video.srcObject=stream;await video.play();
+  cv.width=video.videoWidth;cv.height=video.videoHeight;
+  cv.style.transform=facing==='user'?'scaleX(-1)':'none';
+}
+
+async function init(){
+  $('err').textContent='';$('go').disabled=true;$('go').textContent='Loading…';
+  try{
+    if(!window.Pose)throw new Error('Pose model script could not load.');
+    await startCam();
+    pose=new Pose({locateFile:f=>'https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404/'+f});
+    pose.setOptions({modelComplexity:1,smoothLandmarks:true,minDetectionConfidence:.5,minTrackingConfidence:.5});
+    pose.onResults(onResults);
+    await pose.initialize();
+    $('start').style.display='none';
+    running=true;loop();
+  }catch(e){
+    $('err').textContent='Could not start: '+(e.message||e)+' Check camera permission and connection.';
+    $('go').disabled=false;$('go').textContent='Try again';
+  }
+}
+
+async function loop(){
+  if(!running)return;
+  if(video.readyState>=2){try{await pose.send({image:video});}catch(e){}}
+  requestAnimationFrame(loop);
+}
+
+function setStatus(t,c){const s=$('status');s.textContent=t;s.style.color=c||'#fff';}
+
+function onResults(r){
+  const W=cv.width,H=cv.height;
+  ctx.drawImage(video,0,0,W,H);
+  const L=r.poseLandmarks;
+  if(!L){setStatus('Step back so your whole body is in view','var(--warn)');return;}
+  const vis=i=>(L[i].visibility??0);
+  // Angles per side
+  const sides=[[11,13,15,23,27],[12,14,16,24,28]];
+  const angs=[];
+  sides.forEach(s=>{
+    if(Math.min(vis(s[0]),vis(s[1]),vis(s[2]))>.5)angs.push(ang(L[s[0]],L[s[1]],L[s[2]],W,H));
+  });
+  // Plank check: body roughly horizontal
+  const sh={x:(L[11].x+L[12].x)/2,y:(L[11].y+L[12].y)/2};
+  const hp={x:(L[23].x+L[24].x)/2,y:(L[23].y+L[24].y)/2};
+  const an=(vis(27)+vis(28))/2>.4?{x:(L[27].x+L[28].x)/2,y:(L[27].y+L[28].y)/2}:hp;
+  const bx=(an.x-sh.x)*W,by=(an.y-sh.y)*H;
+  const bodyDeg=Math.abs(Math.atan2(by,Math.abs(bx)||1e-6))*180/Math.PI;
+  const bodyLen=Math.hypot(bx,by);
+  const hipsVis=(vis(23)+vis(24))/2>.4;
+  const plank=hipsVis&&bodyDeg<38&&bodyLen>H*0.15;
+  const now=performance.now();
+
+  // Draw skeleton
+  const inDown=stage==='down';
+  ctx.lineCap='round';
+  BONES.forEach(([a,b])=>{
+    if(vis(a)<.4||vis(b)<.4)return;
+    const isArm=ARM.some(p=>p[0]===a&&p[1]===b);
+    ctx.strokeStyle=isArm?(inDown?'#ffb020':'#39ff88'):'rgba(255,255,255,.75)';
+    ctx.lineWidth=isArm?Math.max(7,W/110):Math.max(4,W/200);
+    ctx.beginPath();ctx.moveTo(L[a].x*W,L[a].y*H);ctx.lineTo(L[b].x*W,L[b].y*H);ctx.stroke();
+  });
+  [11,12,13,14,15,16,23,24,25,26,27,28].forEach(i=>{
+    if(vis(i)<.4)return;
+    ctx.fillStyle=[13,14].includes(i)?'#fff':'#39ff88';
+    ctx.beginPath();ctx.arc(L[i].x*W,L[i].y*H,[13,14].includes(i)?W/90:W/150,0,7);ctx.fill();
+  });
+
+  if(!angs.length){setStatus('Arms not visible. Turn side-on to the camera','var(--warn)');return;}
+  const a=angs.reduce((x,y)=>x+y,0)/angs.length;
+  sm=sm===null?a:sm+0.45*(a-sm);
+
+  // Elbow angle label (drawn unmirrored)
+  const e=vis(13)>=vis(14)?13:14;
+  ctx.save();
+  const ex=L[e].x*W,ey=L[e].y*H;
+  if(facing==='user'){ctx.translate(ex,ey);ctx.scale(-1,1);ctx.translate(-ex,-ey);}
+  ctx.font='bold '+Math.round(W/38)+'px sans-serif';ctx.fillStyle='#fff';ctx.strokeStyle='#000';ctx.lineWidth=4;
+  const txt=Math.round(sm)+'°';ctx.strokeText(txt,ex+W/60,ey-W/60);ctx.fillText(txt,ex+W/60,ey-W/60);
+  ctx.restore();
+
+  // Depth bar
+  const pct=Math.max(0,Math.min(1,(UP+5-sm)/(UP+5-DOWN+10)));
+  $('fill').style.height=(pct*100)+'%';
+
+  // Counting state machine
+  if(!plank){
+    if(now-lastPlank>1200){stage=null;}
+    setStatus('Get into pushup position (side-on)','var(--warn)');
+    return;
+  }
+  lastPlank=now;
+  if(stage===null){
+    if(sm>UP){stage='up';}
+    setStatus('Arms straight to begin');
+  }else if(stage==='up'){
+    setStatus('UP','var(--accent)');
+    if(sm<DOWN){stage='down';downAt=now;beep(500);}
+  }else if(stage==='down'){
+    setStatus('DOWN — push up!','var(--warn)');
+    if(sm>UP){
+      if(now-downAt>=MIN_REP_MS&&now-lastCount>400){
+        count++;lastCount=now;$('count').textContent=count;beep(900);
+        if(navigator.vibrate)navigator.vibrate(40);
+      }
+      stage='up';
+    }
+  }
+}
+
+$('go').onclick=init;
+$('flip').onclick=async()=>{facing=facing==='user'?'environment':'user';try{await startCam();}catch(e){}};
+$('reset').onclick=()=>{count=0;stage=null;sm=null;$('count').textContent=0;};
+$('mute').onclick=()=>{sound=!sound;$('mute').textContent=sound?'Sound on':'Sound off';};
+document.addEventListener('visibilitychange',()=>{});
+try{if('wakeLock' in navigator)$('go').addEventListener('click',()=>navigator.wakeLock.request('screen').catch(()=>{}));}catch(e){}
+})();
+</script>
+</body>
+</html>
